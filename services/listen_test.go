@@ -150,3 +150,60 @@ func TestRefreshIntervalDefaultsAndCanBeConfigured(t *testing.T) {
 		t.Fatalf("invalid interval should reset to default, got %d", got)
 	}
 }
+
+func TestBarkBaseURLAppendsGeneratedMessage(t *testing.T) {
+	requestPath := make(chan string, 1)
+	requestQuery := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath <- r.URL.Path
+		requestQuery <- r.URL.Query().Get("url")
+		_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+	}))
+	defer server.Close()
+
+	service := listenService{BarkNotifyUrl: server.URL + "/device-key"}
+	if err := service.SendPushNotificationByBark("Test Title", "Test Content", "https://example.test/bag"); err != nil {
+		t.Fatalf("unexpected Bark error: %v", err)
+	}
+	if got := <-requestPath; got != "/device-key/Test Title/Test Content" {
+		t.Fatalf("unexpected Bark request path: %s", got)
+	}
+	if got := <-requestQuery; got != "https://example.test/bag" {
+		t.Fatalf("unexpected Bark target URL: %s", got)
+	}
+}
+
+func TestBarkCompleteURLIsUsedWithoutAppendingMessage(t *testing.T) {
+	requestPath := make(chan string, 1)
+	requestCall := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath <- r.URL.Path
+		requestCall <- r.URL.Query().Get("call")
+		_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+	}))
+	defer server.Close()
+
+	service := listenService{BarkNotifyUrl: server.URL + "/device-key/FixedTitle/FixedBody?call=1"}
+	if err := service.SendPushNotificationByBark("Generated Title", "Generated Content", "https://example.test/bag"); err != nil {
+		t.Fatalf("unexpected Bark error: %v", err)
+	}
+	if got := <-requestPath; got != "/device-key/FixedTitle/FixedBody" {
+		t.Fatalf("complete Bark URL was modified: %s", got)
+	}
+	if got := <-requestCall; got != "1" {
+		t.Fatalf("Bark call parameter was not preserved: %s", got)
+	}
+}
+
+func TestBarkReportsHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "failure", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	service := listenService{BarkNotifyUrl: server.URL + "/device-key"}
+	err := service.SendPushNotificationByBark("Title", "Content", "")
+	if err == nil || !strings.Contains(err.Error(), "HTTP 502") {
+		t.Fatalf("expected Bark HTTP error, got %v", err)
+	}
+}

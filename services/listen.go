@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -225,7 +226,12 @@ func (s *listenService) Run() {
 							Content: msg,
 						})
 						go s.AlertMp3()
-						go s.SendPushNotificationByBark("有货提醒", msg, bagUrl)
+						go func() {
+							if err := s.SendPushNotificationByBark("有货提醒", msg, bagUrl); err != nil {
+								log.Printf("Bark 通知失败: %v", err)
+								dialog.ShowError(fmt.Errorf("Bark 通知失败: %w", err), view.Window)
+							}
+						}()
 						break
 					} else {
 						s.UpdateStatus(key, StatusOutStock)
@@ -402,17 +408,67 @@ func (s *listenService) AlertMp3() {
 	<-done
 }
 
-func (s *listenService) SendPushNotificationByBark(title string, content string, bagUrl string) {
-
-	if len(s.BarkNotifyUrl) <= 0 {
-		return
+func (s *listenService) buildBarkURL(title string, content string, bagURL string) (string, error) {
+	configuredURL := strings.TrimSpace(s.BarkNotifyUrl)
+	if configuredURL == "" {
+		return "", nil
 	}
 
-	apiUrl := fmt.Sprintf("%s/%s/%s?url=%s", strings.TrimRight(s.BarkNotifyUrl, "/"), title, content, bagUrl)
+	parsedURL, err := url.Parse(configuredURL)
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return "", fmt.Errorf("Bark 地址格式不正确")
+	}
 
-	response, err := http.Get(apiUrl)
+	pathSegments := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
+	if len(pathSegments) == 0 || pathSegments[0] == "" {
+		return "", fmt.Errorf("Bark 地址缺少设备 Key")
+	}
+
+	// A URL containing only the device key is a base URL, so append the
+	// generated title and content. A URL with more path segments is already a
+	// complete Bark push URL and is used as configured.
+	if len(pathSegments) == 1 {
+		parsedURL.Path = strings.TrimRight(parsedURL.Path, "/") + "/" + title + "/" + content
+	}
+
+	query := parsedURL.Query()
+	if bagURL != "" {
+		query.Set("url", bagURL)
+	}
+	parsedURL.RawQuery = query.Encode()
+	return parsedURL.String(), nil
+}
+
+func (s *listenService) SendPushNotificationByBark(title string, content string, bagURL string) error {
+	apiURL, err := s.buildBarkURL(title, content, bagURL)
+	if err != nil || apiURL == "" {
+		return err
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Get(apiURL)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("请求失败: %w", err)
 	}
 	defer response.Body.Close()
+
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if readErr != nil {
+		return fmt.Errorf("读取响应失败: %w", readErr)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("接口返回 HTTP %d", response.StatusCode)
+	}
+	if gjson.ValidBytes(body) {
+		code := gjson.GetBytes(body, "code")
+		if code.Exists() && code.Int() != 200 {
+			message := gjson.GetBytes(body, "message").String()
+			if message == "" {
+				message = "未知错误"
+			}
+			return fmt.Errorf("接口返回错误: %s", message)
+		}
+	}
+
+	return nil
 }

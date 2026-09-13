@@ -65,6 +65,8 @@ GOROOT 为 GO 安装目录，根据实际安装位置修改
 1. App Store 下载并安装 App 「Bark」，并允许「Bark」进行推送
 2. 打开「Bark」，复制应用中代表你自己设备的地址（格式如` https://api.day.app/xxxxxxxxx `），粘贴至本应用的`Bark 通知地址`栏
 3. 点击 `测试 Bark 通知`，确认应用能够通知到你的 iOS 设备
+
+也支持直接填写包含标题、内容和参数的完整 Bark 推送链接。
 4. 更多内容请参考 `https://bark.day.app/`
 
 ## Contributors
