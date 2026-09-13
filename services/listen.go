@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -28,9 +29,11 @@ import (
 )
 
 const (
-	StatusOutStock = "无货"
-	StatusInStock  = "有货"
-	StatusWait     = "等待"
+	StatusOutStock                = "无货"
+	StatusInStock                 = "有货"
+	StatusWait                    = "等待"
+	StatusError                   = "查询失败"
+	DefaultRefreshIntervalSeconds = 15
 
 	Pause   = "暂停"
 	Running = "监听中"
@@ -44,32 +47,49 @@ var Listen = listenService{
 }
 
 type listenService struct {
-	items         map[string]ListenItem
-	Status        binding.String
-	Area          model.Area
-	Logs          *widget.Label
-	BarkNotifyUrl string
+	items          map[string]ListenItem
+	Status         binding.String
+	Area           model.Area
+	Logs           *widget.Label
+	BarkNotifyUrl  string
+	refreshSeconds atomic.Int64
 }
 
 type ListenItem struct {
-	Store   model.Store
-	Product model.Product
-	Status  string
-	Time    carbon.DateTime
+	Store        model.Store
+	Product      model.Product
+	Status       string
+	Time         carbon.DateTime
+	ErrorMessage string `json:"error_message,omitempty"`
+}
+
+type availabilityResult struct {
+	StoreNumber string
+	SKUs        map[string]bool
+	Err         error
 }
 
 func (s *listenService) Add(areaTitle string, storeTitle string, productTitle string, barkNotifyUrl string) {
+	s.AddStores(areaTitle, []string{storeTitle}, productTitle, barkNotifyUrl)
+}
 
-	store := Store.GetStore(areaTitle, storeTitle)
+// AddStores adds the same product for every selected store. Existing
+// store/product pairs are left untouched, so repeated clicks are safe.
+func (s *listenService) AddStores(areaTitle string, storeTitles []string, productTitle string, barkNotifyUrl string) {
 	product := Product.GetProduct(areaTitle, productTitle)
+	addedAt := currentDateTime()
 
-	uniqKey := store.StoreNumber + "." + product.Code
+	for _, storeTitle := range storeTitles {
+		store := Store.GetStore(areaTitle, storeTitle)
+		uniqKey := store.StoreNumber + "." + product.Code
 
-	if s.items[uniqKey].Store.StoreNumber == "" {
-		s.items[uniqKey] = ListenItem{
-			Store:   store,
-			Product: product,
-			Status:  StatusWait,
+		if s.items[uniqKey].Store.StoreNumber == "" {
+			s.items[uniqKey] = ListenItem{
+				Store:   store,
+				Product: product,
+				Status:  StatusWait,
+				Time:    addedAt,
+			}
 		}
 	}
 
@@ -83,6 +103,18 @@ func (s *listenService) Clean() {
 }
 
 func (s *listenService) SetListenItems(items map[string]ListenItem) {
+	if items == nil {
+		items = make(map[string]ListenItem)
+	}
+	loadedAt := currentDateTime()
+	for key, item := range items {
+		// Older settings saved an empty DateTime. Carbon keeps that value as
+		// invalid (not necessarily zero), which otherwise renders as "".
+		if !item.Time.IsValid() {
+			item.Time = loadedAt
+			items[key] = item
+		}
+	}
 	s.items = items
 	s.UpdateLogStr()
 }
@@ -95,14 +127,21 @@ func (s *listenService) UpdateLogStr() {
 	var str string
 
 	for _, item := range s.items {
-
+		timestamp := item.Time.ToDateTimeString()
+		if timestamp == "" {
+			timestamp = time.Now().Format("2006-01-02 15:04:05")
+		}
+		errorSuffix := ""
+		if item.ErrorMessage != "" {
+			errorSuffix = " 错误: " + strings.ReplaceAll(item.ErrorMessage, "\n", " ")
+		}
 		str += fmt.Sprintf(
-			"[%s] %s %s %s %s",
+			"[%s] [%s] %s %s%s\n",
+			timestamp,
 			item.Status,
-			item.Time,
 			item.Store.CityStoreName,
 			item.Product.Title,
-			"\n",
+			errorSuffix,
 		)
 	}
 
@@ -111,9 +150,44 @@ func (s *listenService) UpdateLogStr() {
 
 func (s *listenService) UpdateStatus(uniqKey string, status string) {
 	item := s.items[uniqKey]
-	item.Time = carbon.DateTime{Carbon: carbon.Now(carbon.Shanghai)}
+	item.Time = currentDateTime()
 	item.Status = status
+	item.ErrorMessage = ""
 	s.items[uniqKey] = item
+}
+
+func (s *listenService) UpdateError(uniqKey string, err error) {
+	item := s.items[uniqKey]
+	item.Time = currentDateTime()
+	item.Status = StatusError
+	item.ErrorMessage = err.Error()
+	s.items[uniqKey] = item
+}
+
+func currentDateTime() carbon.DateTime {
+	return carbon.DateTime{Carbon: carbon.Now(carbon.Shanghai)}
+}
+
+func (s *listenService) SetRefreshIntervalSeconds(seconds int) {
+	if seconds < 1 {
+		seconds = DefaultRefreshIntervalSeconds
+	}
+	s.refreshSeconds.Store(int64(seconds))
+}
+
+func (s *listenService) GetRefreshIntervalSeconds() int {
+	seconds := s.refreshSeconds.Load()
+	if seconds < 1 {
+		return DefaultRefreshIntervalSeconds
+	}
+	return int(seconds)
+}
+
+func (s *listenService) appleStoreBaseURL() string {
+	if s.Area.Locale == "zh_CN" {
+		return "https://www.apple.com.cn"
+	}
+	return fmt.Sprintf("https://www.apple.com/%s", strings.Trim(s.Area.ShortCode, "/"))
 }
 
 func (s *listenService) Run() {
@@ -121,17 +195,27 @@ func (s *listenService) Run() {
 
 	go func() {
 		for {
+			nextCheckDelay := 500 * time.Millisecond
 			if stats, ok := s.Status.Get(); ok == nil && stats == Running && len(s.items) > 0 {
-				skus := s.groupByStore()
+				skus, storeErrors := s.groupByStore()
+				nextCheckDelay = time.Duration(s.GetRefreshIntervalSeconds()) * time.Second
 
 				for key, item := range s.items {
+					if err := storeErrors[item.Store.StoreNumber]; err != nil {
+						s.UpdateError(key, err)
+						continue
+					}
+					if err := storeErrors["*"]; err != nil {
+						s.UpdateError(key, err)
+						continue
+					}
 					status := skus[item.Store.StoreNumber+"."+item.Product.Code]
 
 					if status {
 						s.UpdateStatus(key, StatusInStock)
 						s.Status.Set(Pause)
 
-						var bagUrl = fmt.Sprintf("https://www.apple.com/%s/shop/bag", s.Area.ShortCode)
+						var bagUrl = s.appleStoreBaseURL() + "/shop/bag"
 						// 进入购物袋
 						s.openBrowser(bagUrl)
 						msg := fmt.Sprintf("%s %s 有货", item.Store.CityStoreName, item.Product.Title)
@@ -151,17 +235,19 @@ func (s *listenService) Run() {
 				s.UpdateLogStr()
 			}
 
-			time.Sleep(time.Millisecond * 500)
+			time.Sleep(nextCheckDelay)
 		}
 	}()
 }
 
-func (s *listenService) groupByStore() map[string]bool {
-	skus := map[string]bool{}
+func (s *listenService) groupByStore() (skus map[string]bool, storeErrors map[string]error) {
+	skus = map[string]bool{}
+	storeErrors = map[string]error{}
 
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println(r)
+			storeErrors["*"] = fmt.Errorf("库存接口处理异常: %v", r)
 		}
 	}()
 
@@ -176,8 +262,8 @@ func (s *listenService) groupByStore() map[string]bool {
 
 		var uri url.URL
 		q := uri.Query()
-		q.Set("little", "true")
-		q.Set("mt", "regular")
+		q.Set("pl", "true")
+		q.Set("mts.0", "regular")
 		q.Set("store", storeNumber)
 
 		for index, item := range items {
@@ -186,58 +272,85 @@ func (s *listenService) groupByStore() map[string]bool {
 
 		queryStr := q.Encode()
 
-		link := fmt.Sprintf(
-			"https://www.apple.com/%s/shop/fulfillment-messages?%s",
-			s.Area.ShortCode,
-			queryStr,
-		)
+		link := fmt.Sprintf("%s/shop/retail/pickup-message?%s", s.appleStoreBaseURL(), queryStr)
 
 		reqs[storeNumber] = link
 	}
 
 	count := len(reqs)
 	if count < 1 {
-		return skus
+		return skus, storeErrors
 	}
 
-	ch := make(chan map[string]bool, count)
+	ch := make(chan availabilityResult, count)
 
-	for _, link := range reqs {
-		go s.getSkuByLink(ch, link)
+	for storeNumber, link := range reqs {
+		go s.getSkuByLink(ch, storeNumber, link)
 	}
 
 	for i := 0; i < count; i++ {
-		for key, v := range <-ch {
+		result := <-ch
+		if result.Err != nil {
+			storeErrors[result.StoreNumber] = result.Err
+			continue
+		}
+		for key, v := range result.SKUs {
 			skus[key] = v
 		}
 	}
 
-	return skus
+	return skus, storeErrors
 }
 
-func (s *listenService) getSkuByLink(ch chan map[string]bool, skUrl string) {
+func (s *listenService) getSkuByLink(ch chan availabilityResult, storeNumber string, skUrl string) {
 	skus := map[string]bool{}
 
 	resp, body, errs := gorequest.New().
 		Get(skUrl).
-		Set("referer", "https://www.apple.com/shop/buy-iphone").
+		Set("referer", s.appleStoreBaseURL()+"/shop/buy-iphone").
 		Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.71 Safari/537.36").
-		Timeout(time.Second * 3).End()
+		Timeout(time.Second * 10).End()
 	if len(errs) > 0 {
 		log.Println(errs)
-		ch <- skus
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("请求失败: %v", errs[0])}
+		return
+	}
+	if resp == nil {
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("接口未返回响应")}
+		return
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("接口返回 HTTP %d", resp.StatusCode)}
+		return
+	}
+	if !gjson.Valid(body) {
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("接口返回的数据不是有效 JSON")}
 		return
 	}
 
 	log.Println(resp.Status, skUrl)
-	for _, result := range gjson.Get(body, "body.content.pickupMessage.stores").Array() {
+	stores := gjson.Get(body, "body.stores")
+	if !stores.Exists() {
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("接口返回缺少门店库存数据")}
+		return
+	}
+	foundRequestedStore := false
+	for _, result := range stores.Array() {
+		returnedStoreNumber := result.Get("storeNumber").String()
+		if returnedStoreNumber == storeNumber {
+			foundRequestedStore = true
+		}
 		for productCode, availability := range result.Get("partsAvailability").Map() {
-			uniqKey := fmt.Sprintf("%s.%s", result.Get("storeNumber").String(), productCode)
-			skus[uniqKey] = availability.Get("messageTypes.compact.storeSelectionEnabled").Bool()
+			uniqKey := fmt.Sprintf("%s.%s", returnedStoreNumber, productCode)
+			skus[uniqKey] = availability.Get("pickupDisplay").String() == "available"
 		}
 	}
+	if !foundRequestedStore {
+		ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus, Err: fmt.Errorf("接口未返回所选门店 %s 的库存数据", storeNumber)}
+		return
+	}
 
-	ch <- skus
+	ch <- availabilityResult{StoreNumber: storeNumber, SKUs: skus}
 }
 
 // 型号对应预约地址

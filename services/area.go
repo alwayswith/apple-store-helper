@@ -4,6 +4,8 @@ import (
 	"apple-store-helper/config"
 	"apple-store-helper/model"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/thoas/go-funk"
 	"github.com/tidwall/gjson"
@@ -24,20 +26,45 @@ func (s *areaService) ProductsByCode(local string) []model.Product {
 	area := areaInterface.(model.Area)
 
 	var products []model.Product
+	seenPartNumbers := make(map[string]struct{})
 	productsJson := gjson.ParseBytes(config.MustReadConfigFile(fmt.Sprintf("products_%s.json", area.Locale)))
 
 	for _, json := range productsJson.Array() {
 		for _, result := range json.Get("products").Array() {
+			partNumber := result.Get("partNumber").String()
+			if partNumber == "" {
+				continue
+			}
+			if _, exists := seenPartNumbers[partNumber]; exists {
+				continue
+			}
+			seenPartNumbers[partNumber] = struct{}{}
+
 			color := json.Get(fmt.Sprintf("displayValues.dimensionColor.%s.value", result.Get("dimensionColor")))
 			products = append(products, model.Product{
 				Title: fmt.Sprintf("%s - %s - %s", result.Get("familyType"), color, result.Get("dimensionCapacity")),
 				Type:  result.Get("familyType").String(),
-				Code:  result.Get("partNumber").String(),
+				Code:  partNumber,
 			})
 		}
 	}
 
+	// Keep newly released models at the top of the selector while preserving
+	// Apple's order for colors and capacities within each family.
+	sort.SliceStable(products, func(i, j int) bool {
+		return productGeneration(products[i].Type) > productGeneration(products[j].Type)
+	})
+
 	return products
+}
+
+func productGeneration(productType string) int {
+	for generation := 30; generation >= 1; generation-- {
+		if strings.HasPrefix(productType, fmt.Sprintf("iphone%d", generation)) {
+			return generation
+		}
+	}
+	return 0
 }
 
 func (s *areaService) ForOptions() []string {

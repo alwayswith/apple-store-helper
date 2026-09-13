@@ -1,6 +1,6 @@
 # Apple Store 预约助手
 
-## 支持 iPhone 17 系列
+## 支持 iPhone 17、iPhone 18 Pro 系列
 
 ![UI](screenshot.png)
 
@@ -55,9 +55,11 @@ GOROOT 为 GO 安装目录，根据实际安装位置修改
 
 1. 前往 [release](https://github.com/hteen/apple-store-helper/releases) 页面下载对应系统的程序，启动 
 2. 在 Apple 官网将需要购买的型号加入购物车
-3. 选择地区、门店和型号，点击`添加`按钮，将需要监听的型号添加到监听列表
+3. 选择地区、一个或多个门店和型号，点击`添加`按钮，将需要监听的型号批量添加到监听列表
 4. 点击`开始`按钮开始监听，检测到有货时会自动打开购物车页面
 5. 匹配到有货后会自动暂停监听，直到再次点击 `开始`
+
+刷新间隔可在界面中按秒配置，默认为 15 秒。
 
 ### 有货时推送通知到 iOS 设备
 1. App Store 下载并安装 App 「Bark」，并允许「Bark」进行推送
@@ -71,4 +73,3 @@ GOROOT 为 GO 安装目录，根据实际安装位置修改
 - [@Black-Hole](https://github.com/BlackHole1)
 - [@RayJason](https://github.com/RayJason)
 - [@Warkeeper](https://github.com/Warkeeper)
-

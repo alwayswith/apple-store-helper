@@ -6,6 +6,9 @@ import (
 	"apple-store-helper/theme"
 	"apple-store-helper/view"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -27,8 +30,9 @@ func main() {
 	defaultArea := services.Listen.Area.Title
 
 	// 门店选择器 (Store Selector)
-	storeWidget := widget.NewSelect(services.Store.ByAreaTitleForOptions(defaultArea), nil)
-	storeWidget.PlaceHolder = "请选择自提门店"
+	storeWidget := widget.NewCheckGroup(services.Store.ByAreaTitleForOptions(defaultArea), nil)
+	storeScroll := container.NewVScroll(storeWidget)
+	storeScroll.SetMinSize(fyne.NewSize(600, 180))
 
 	// 型号选择器 (Product Selector)
 	productWidget := widget.NewSelect(services.Product.ByAreaTitleForOptions(defaultArea), nil)
@@ -38,6 +42,11 @@ func main() {
 	barkWidget := widget.NewEntry()
 	barkWidget.SetPlaceHolder("https://api.day.app/你的BarkKey")
 
+	// 刷新间隔输入框，单位为秒
+	refreshIntervalWidget := widget.NewEntry()
+	refreshIntervalWidget.SetText(strconv.Itoa(services.DefaultRefreshIntervalSeconds))
+	refreshIntervalWidget.SetPlaceHolder("15")
+
 	// 地区选择器 (Area Selector)
 	areaWidget := widget.NewRadioGroup(services.Area.ForOptions(), func(value string) {
 		// 防止空值或无效值导致崩溃
@@ -46,7 +55,7 @@ func main() {
 		}
 
 		storeWidget.Options = services.Store.ByAreaTitleForOptions(value)
-		storeWidget.ClearSelected()
+		storeWidget.SetSelected(nil)
 
 		productWidget.Options = services.Product.ByAreaTitleForOptions(value)
 		productWidget.ClearSelected()
@@ -58,23 +67,24 @@ func main() {
 	areaWidget.Horizontal = true
 
 	help := `1. 在 Apple 官网将需要购买的型号加入购物车
-2. 选择地区、门店和型号，点击“添加”按钮，将需要监听的型号添加到监听列表
+2. 选择地区、一个或多个门店和型号，点击“添加”按钮，将需要监听的型号批量添加到监听列表
 3. 点击“开始”按钮开始监听，检测到有货时会自动打开购物车页面
 `
 
-	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget)
+	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget, refreshIntervalWidget)
 
 	// 初始化 GUI 窗口内容 (Initialize GUI)
 	view.Window.SetContent(container.NewVBox(
 		widget.NewLabel(help),
 		container.New(layout.NewFormLayout(), widget.NewLabel("选择地区:"), areaWidget),
-		container.New(layout.NewFormLayout(), widget.NewLabel("选择门店:"), storeWidget),
+		container.New(layout.NewFormLayout(), widget.NewLabel("选择门店(可多选):"), storeScroll),
 		container.New(layout.NewFormLayout(), widget.NewLabel("选择型号:"), productWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("Bark 通知地址"), barkWidget),
+		container.New(layout.NewFormLayout(), widget.NewLabel("刷新间隔(秒):"), refreshIntervalWidget),
 
 		container.NewBorder(nil, nil,
-			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget),
-			createControlButtons(),
+			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget, refreshIntervalWidget),
+			createControlButtons(areaWidget, storeWidget, productWidget, barkWidget, refreshIntervalWidget),
 		),
 
 		services.Listen.Logs,
@@ -102,39 +112,78 @@ func initFyneApp() {
 }
 
 // 加载用户设置缓存 (Load user settings cache)
-func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry) {
+func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.CheckGroup, productWidget *widget.Select, barkNotifyWidget *widget.Entry, refreshIntervalWidget *widget.Entry) {
 	settings, err := services.LoadSettings()
 	if err == nil {
 		areaWidget.SetSelected(settings.SelectedArea)
-		storeWidget.SetSelected(settings.SelectedStore)
+		selectedStores := settings.SelectedStores
+		if len(selectedStores) == 0 && settings.SelectedStore != "" {
+			selectedStores = []string{settings.SelectedStore}
+		}
+		storeWidget.SetSelected(selectedStores)
 		productWidget.SetSelected(settings.SelectedProduct)
 		services.Listen.SetListenItems(settings.ListenItems)
 		barkNotifyWidget.SetText(settings.BarkNotifyUrl)
+		seconds := settings.RefreshIntervalSeconds
+		if seconds < 1 {
+			seconds = services.DefaultRefreshIntervalSeconds
+		}
+		refreshIntervalWidget.SetText(strconv.Itoa(seconds))
+		services.Listen.SetRefreshIntervalSeconds(seconds)
 	} else {
 		areaWidget.SetSelected(services.Listen.Area.Title)
+		services.Listen.SetRefreshIntervalSeconds(services.DefaultRefreshIntervalSeconds)
 	}
 }
 
+func parseRefreshIntervalSeconds(refreshIntervalWidget *widget.Entry) (int, error) {
+	seconds, err := strconv.Atoi(strings.TrimSpace(refreshIntervalWidget.Text))
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return 0, fmt.Errorf("刷新间隔请输入 1 到 3600 之间的整数秒数")
+	}
+	return seconds, nil
+}
+
+func saveCurrentSettings(areaWidget *widget.RadioGroup, storeWidget *widget.CheckGroup, productWidget *widget.Select, barkNotifyWidget *widget.Entry, refreshIntervalSeconds int) error {
+	selectedStore := ""
+	if len(storeWidget.Selected) > 0 {
+		selectedStore = storeWidget.Selected[0]
+	}
+	return services.SaveSettings(services.UserSettings{
+		SelectedArea:           areaWidget.Selected,
+		SelectedStore:          selectedStore,
+		SelectedStores:         append([]string(nil), storeWidget.Selected...),
+		SelectedProduct:        productWidget.Selected,
+		BarkNotifyUrl:          barkNotifyWidget.Text,
+		RefreshIntervalSeconds: refreshIntervalSeconds,
+		ListenItems:            services.Listen.GetListenItems(),
+	})
+}
+
 // 创建动作按钮 (Create action buttons)
-func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry) *fyne.Container {
+func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.CheckGroup, productWidget *widget.Select, barkNotifyWidget *widget.Entry, refreshIntervalWidget *widget.Entry) *fyne.Container {
 	return container.NewHBox(
 		widget.NewButton("添加", func() {
-			if storeWidget.Selected == "" || productWidget.Selected == "" {
-				dialog.ShowError(errors.New("请选择门店和型号"), view.Window)
+			if len(storeWidget.Selected) == 0 || productWidget.Selected == "" {
+				dialog.ShowError(errors.New("请至少选择一个门店和型号"), view.Window)
 			} else {
-				services.Listen.Add(areaWidget.Selected, storeWidget.Selected, productWidget.Selected, barkNotifyWidget.Text)
-				services.SaveSettings(services.UserSettings{
-					SelectedArea:    areaWidget.Selected,
-					SelectedStore:   storeWidget.Selected,
-					SelectedProduct: productWidget.Selected,
-					BarkNotifyUrl:   barkNotifyWidget.Text,
-					ListenItems:     services.Listen.GetListenItems(),
-				})
+				seconds, err := parseRefreshIntervalSeconds(refreshIntervalWidget)
+				if err != nil {
+					dialog.ShowError(err, view.Window)
+					return
+				}
+				services.Listen.SetRefreshIntervalSeconds(seconds)
+				services.Listen.AddStores(areaWidget.Selected, storeWidget.Selected, productWidget.Selected, barkNotifyWidget.Text)
+				if err := saveCurrentSettings(areaWidget, storeWidget, productWidget, barkNotifyWidget, seconds); err != nil {
+					dialog.ShowError(fmt.Errorf("保存设置失败: %w", err), view.Window)
+				}
 			}
 		}),
 		widget.NewButton("清空", func() {
 			services.Listen.Clean()
-			services.ClearSettings()
+			_ = services.ClearSettings()
+			refreshIntervalWidget.SetText(strconv.Itoa(services.DefaultRefreshIntervalSeconds))
+			services.Listen.SetRefreshIntervalSeconds(services.DefaultRefreshIntervalSeconds)
 		}),
 		widget.NewButton("试听(有货提示音)", func() {
 			go services.Listen.AlertMp3()
@@ -147,9 +196,19 @@ func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Sele
 }
 
 // 创建控制按钮 (Create control buttons)
-func createControlButtons() *fyne.Container {
+func createControlButtons(areaWidget *widget.RadioGroup, storeWidget *widget.CheckGroup, productWidget *widget.Select, barkNotifyWidget *widget.Entry, refreshIntervalWidget *widget.Entry) *fyne.Container {
 	return container.NewHBox(
 		widget.NewButton("开始", func() {
+			seconds, err := parseRefreshIntervalSeconds(refreshIntervalWidget)
+			if err != nil {
+				dialog.ShowError(err, view.Window)
+				return
+			}
+			services.Listen.SetRefreshIntervalSeconds(seconds)
+			if err := saveCurrentSettings(areaWidget, storeWidget, productWidget, barkNotifyWidget, seconds); err != nil {
+				dialog.ShowError(fmt.Errorf("保存设置失败: %w", err), view.Window)
+				return
+			}
 			services.Listen.Status.Set(services.Running)
 		}),
 		widget.NewButton("暂停", func() {
